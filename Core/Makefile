@@ -12,17 +12,17 @@ TARGET_DEBUG_SHARED  = Debug/PSXCore.so
 TARGET_RELEASE_SHARED = Release/PSXCore.so
 
 DEFINES_COMMON = -DEMU_COMPILE -DEMU_LITTLE_ENDIAN -D_LIB
-CFLAGS_COMMON  = -Wall -m32 -ffast-math -std=gnu99 -fPIC
+CFLAGS_COMMON  = -Wall -ffast-math -std=gnu99 -fPIC
 
 CFLAGS_DEBUG   = $(CFLAGS_COMMON) $(DEFINES_COMMON) -D_DEBUG -O0 -g \
                  -fno-inline
 
 CFLAGS_RELEASE = $(CFLAGS_COMMON) $(DEFINES_COMMON) -DNDEBUG -O3 \
                  -finline-functions -fomit-frame-pointer \
-                 -ffunction-sections -mno-sse2 \
+                 -ffunction-sections \
                  -ffast-math
 
-LDFLAGS = -m32 -shared
+LDFLAGS = -shared
 
 .PHONY: all debug release clean
 
