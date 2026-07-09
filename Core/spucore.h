@@ -31,6 +31,14 @@ void   EMU_CALL spucore_setflag     (void *state, uint32 n, int value);
 uint32 EMU_CALL spucore_cycles_until_interrupt(void *state, uint16 *ram, uint32 samples);
 
 /*
+** Stem extraction
+*/
+void   EMU_CALL spucore_set_stem_buf   (void *state, uint32 voice, sint16 *buf);
+void   EMU_CALL spucore_clear_stem_bufs(void *state);
+uint32 EMU_CALL spucore_get_voice_ssa  (void *state, uint32 voice);
+int    EMU_CALL spucore_scan_samples   (uint16 *ram, uint32 ramsize, uint32 reverb_start, uint32 *out_addrs, int max_addrs);
+
+/*
 ** Register definitions
 */
 

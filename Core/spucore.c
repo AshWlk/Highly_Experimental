@@ -397,6 +397,7 @@ struct SPUCORE_STATE {
   sint32 noiseval;
   uint32 irq_decoder_clock;
   uint32 irq_triggered_cycle;
+  sint16 *stem_bufs[24]; /* per-voice stereo output buffers for stem extraction */
 };
 
 struct SPUCORE_IRQ_STATE {
@@ -1731,10 +1732,10 @@ static void EMU_CALL render(struct SPUCORE_STATE *state, uint16 *ram, sint16 *bu
     uint32 main_r = chanbit & maskmain_r;
     uint32 verb_l = chanbit & maskverb_l;
     uint32 verb_r = chanbit & maskverb_r;
-    sint32 *b = buf ? ibuf : NULL;
+    sint32 *b = (buf || state->stem_bufs[ch]) ? ibuf : NULL;
     sint32 *fm = (chanbit & maskfm) ? ibuffm : NULL;
     sint32 *noise = (chanbit & masknoise) ? ibufn : NULL;
-    if(!(main_l | main_r | verb_l | verb_r)) b = NULL;
+    if(!(main_l | main_r | verb_l | verb_r) && !state->stem_bufs[ch]) b = NULL;
     r = render_channel_mono(
       ram, state->memsize, state->chan + ch, b, fm, noise, samples, irq_state_ptr
     );
@@ -1746,13 +1747,25 @@ static void EMU_CALL render(struct SPUCORE_STATE *state, uint16 *ram, sint16 *bu
     if(r < samples) memset(ibuffm + r, 0, 4 * (samples-r));
     v_l = volume_getlevel(state->chan[ch].vol+0);
     v_r = volume_getlevel(state->chan[ch].vol+1);
-    for(i = 0; i < r; i++) {
-      sint32 q_l = (v_l * ibuf[i]) >> 16;
-      sint32 q_r = (v_r * ibuf[i]) >> 16;
-      if(main_l) ibufmix[2*i+0] += q_l;
-      if(main_r) ibufmix[2*i+1] += q_r;
-      if(verb_l) ibufrvb[2*i+0] += q_l;
-      if(verb_r) ibufrvb[2*i+1] += q_r;
+    {
+      sint16 *sbuf = state->stem_bufs[ch];
+      for(i = 0; i < r; i++) {
+        sint32 q_l = (v_l * ibuf[i]) >> 16;
+        sint32 q_r = (v_r * ibuf[i]) >> 16;
+        if(main_l) ibufmix[2*i+0] += q_l;
+        if(main_r) ibufmix[2*i+1] += q_r;
+        if(verb_l) ibufrvb[2*i+0] += q_l;
+        if(verb_r) ibufrvb[2*i+1] += q_r;
+        if(sbuf) {
+          sint32 cl = q_l, cr = q_r;
+          CLIP_PCM_1(cl); CLIP_PCM_1(cr);
+          sbuf[2*i+0] = (sint16)cl;
+          sbuf[2*i+1] = (sint16)cr;
+        }
+      }
+      if(sbuf && r < samples) {
+        memset(sbuf + 2*r, 0, 4*(samples-r));
+      }
     }
   }
 
@@ -2121,6 +2134,48 @@ uint32 EMU_CALL spucore_cycles_until_interrupt(void *state, uint16 *ram, uint32 
   r = (SPUCORESTATE->irq_triggered_cycle == 0xFFFFFFFF) ? 0xFFFFFFFF : SPUCORESTATE->irq_triggered_cycle + r;
   free(backup);
   return r;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/*
+** Stem extraction support
+*/
+
+void EMU_CALL spucore_set_stem_buf(void *state, uint32 voice, sint16 *buf) {
+  if(voice < 24) SPUCORESTATE->stem_bufs[voice] = buf;
+}
+
+void EMU_CALL spucore_clear_stem_bufs(void *state) {
+  int i;
+  for(i = 0; i < 24; i++) SPUCORESTATE->stem_bufs[i] = NULL;
+}
+
+uint32 EMU_CALL spucore_get_voice_ssa(void *state, uint32 voice) {
+  if(voice >= 24) return 0xFFFFFFFF;
+  return SPUCORESTATE->chan[voice].sample.start_block_addr;
+}
+
+int EMU_CALL spucore_scan_samples(uint16 *ram, uint32 ramsize, uint32 reverb_start, uint32 *out_addrs, int max_addrs) {
+  uint32 addr = 0;
+  int count = 0;
+  uint8 *bytes = (uint8 *)ram;
+  uint32 scan_end = (reverb_start < ramsize) ? reverb_start : ramsize;
+
+  while(addr + 16 <= scan_end) {
+    if(count < max_addrs) {
+      out_addrs[count++] = addr;
+    } else {
+      break;
+    }
+    /* Walk to end of this sample (loop-end flag in byte 1, bit 0) */
+    while(addr + 16 <= scan_end) {
+      uint8 flags = bytes[addr + 1];
+      addr += 16;
+      if(flags & 1) break;
+    }
+  }
+
+  return count;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

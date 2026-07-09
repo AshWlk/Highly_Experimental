@@ -810,3 +810,29 @@ uint32 EMU_CALL spu_cycles_until_interrupt(void *state, uint32 samples) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+/*
+** Stem extraction
+*/
+
+void EMU_CALL spu_set_stem_buf(void *state, uint32 voice, sint16 *buf) {
+  spucore_set_stem_buf(CORESTATE(0), voice, buf);
+}
+
+void EMU_CALL spu_clear_stem_bufs(void *state) {
+  spucore_clear_stem_bufs(CORESTATE(0));
+  if(SPUSTATE->version == 2) {
+    spucore_clear_stem_bufs(CORESTATE(1));
+  }
+}
+
+uint32 EMU_CALL spu_get_voice_ssa(void *state, uint32 voice) {
+  return spucore_get_voice_ssa(CORESTATE(0), voice);
+}
+
+int EMU_CALL spu_scan_samples(void *state, uint32 *out_addrs, int max_addrs) {
+  uint32 reverb_start = spucore_getreg(CORESTATE(0), SPUREG_ESA);
+  uint32 ramsize = (SPUSTATE->version == 2) ? 0x200000 : 0x80000;
+  return spucore_scan_samples((uint16*)SPURAM, ramsize, reverb_start, out_addrs, max_addrs);
+}
+
+////////////////////////////////////////////////////////////////////////////////

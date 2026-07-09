@@ -33,6 +33,14 @@ uint32 EMU_CALL spu_cycles_until_interrupt(void *state, uint32 samples);
 void EMU_CALL spu_enable_main(void *state, uint8 enable);
 void EMU_CALL spu_enable_reverb(void *state, uint8 enable);
 
+/*
+** Stem extraction
+*/
+void   EMU_CALL spu_set_stem_buf   (void *state, uint32 voice, sint16 *buf);
+void   EMU_CALL spu_clear_stem_bufs(void *state);
+uint32 EMU_CALL spu_get_voice_ssa  (void *state, uint32 voice);
+int    EMU_CALL spu_scan_samples   (void *state, uint32 *out_addrs, int max_addrs);
+
 #ifdef __cplusplus
 }
 #endif
