@@ -825,6 +825,17 @@ void EMU_CALL spu_clear_stem_bufs(void *state) {
   }
 }
 
+void EMU_CALL spu_set_reverb_buf(void *state, sint16 *buf) {
+  spucore_set_reverb_buf(CORESTATE(0), buf);
+}
+
+void EMU_CALL spu_clear_reverb_buf(void *state) {
+  spucore_clear_reverb_buf(CORESTATE(0));
+  if(SPUSTATE->version == 2) {
+    spucore_clear_reverb_buf(CORESTATE(1));
+  }
+}
+
 uint32 EMU_CALL spu_get_voice_ssa(void *state, uint32 voice) {
   return spucore_get_voice_ssa(CORESTATE(0), voice);
 }

@@ -398,6 +398,7 @@ struct SPUCORE_STATE {
   uint32 irq_decoder_clock;
   uint32 irq_triggered_cycle;
   sint16 *stem_bufs[24]; /* per-voice stereo output buffers for stem extraction */
+  sint16 *reverb_buf;   /* stereo output buffer for the reverb return signal */
 };
 
 struct SPUCORE_IRQ_STATE {
@@ -1837,6 +1838,12 @@ static void EMU_CALL render(struct SPUCORE_STATE *state, uint16 *ram, sint16 *bu
       q_r >>= 15;
       r_l >>= 15;
       r_r >>= 15;
+      if(state->reverb_buf) {
+        sint32 rb_l = (sint32)r_l, rb_r = (sint32)r_r;
+        CLIP_PCM_1(rb_l); CLIP_PCM_1(rb_r);
+        state->reverb_buf[2*i+0] = (sint16)rb_l;
+        state->reverb_buf[2*i+1] = (sint16)rb_r;
+      }
       q_l += r_l;
       q_r += r_r;
       CLIP_PCM_2(q_l, q_r);
@@ -1860,12 +1867,14 @@ void EMU_CALL spucore_render(void *state, uint16 *ram, sint16 *buf, sint16 *exti
     for(ch = 0; ch < 24; ch++) {
       if(SPUCORESTATE->stem_bufs[ch]) SPUCORESTATE->stem_bufs[ch] += 2 * RENDERMAX;
     }
+    if(SPUCORESTATE->reverb_buf) SPUCORESTATE->reverb_buf += 2 * RENDERMAX;
   }
   if(samples) {
     render(SPUCORESTATE, ram, buf, extinput, samples, mainout, effectout);
     for(ch = 0; ch < 24; ch++) {
       if(SPUCORESTATE->stem_bufs[ch]) SPUCORESTATE->stem_bufs[ch] += 2 * samples;
     }
+    if(SPUCORESTATE->reverb_buf) SPUCORESTATE->reverb_buf += 2 * samples;
   }
 }
 
@@ -2136,6 +2145,7 @@ uint32 EMU_CALL spucore_cycles_until_interrupt(void *state, uint16 *ram, uint32 
   ** non-NULL stem_bufs to activate decoding and write speculatively into the caller's
   ** pinned buffers, advancing past their bounds before actual rendering begins. */
   { int i; for(i = 0; i < 24; i++) SPUCORESTATE->stem_bufs[i] = NULL; }
+  SPUCORESTATE->reverb_buf = NULL;
   SPUCORESTATE->irq_triggered_cycle = 0xFFFFFFFF;
   r = 0;
   while(samples > RENDERMAX) {
@@ -2162,6 +2172,14 @@ void EMU_CALL spucore_set_stem_buf(void *state, uint32 voice, sint16 *buf) {
 void EMU_CALL spucore_clear_stem_bufs(void *state) {
   int i;
   for(i = 0; i < 24; i++) SPUCORESTATE->stem_bufs[i] = NULL;
+}
+
+void EMU_CALL spucore_set_reverb_buf(void *state, sint16 *buf) {
+  SPUCORESTATE->reverb_buf = buf;
+}
+
+void EMU_CALL spucore_clear_reverb_buf(void *state) {
+  SPUCORESTATE->reverb_buf = NULL;
 }
 
 uint32 EMU_CALL spucore_get_voice_ssa(void *state, uint32 voice) {
