@@ -836,6 +836,14 @@ void EMU_CALL spu_clear_reverb_buf(void *state) {
   }
 }
 
+uint32 EMU_CALL spu_getreg(void *state, uint32 n) {
+  return spucore_getreg(CORESTATE(0), n);
+}
+
+int EMU_CALL spu_getflag(void *state, uint32 n) {
+  return spucore_getflag(CORESTATE(0), n);
+}
+
 uint32 EMU_CALL spu_get_voice_ssa(void *state, uint32 voice) {
   return spucore_get_voice_ssa(CORESTATE(0), voice);
 }
