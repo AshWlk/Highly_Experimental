@@ -36,10 +36,12 @@ void EMU_CALL spu_enable_reverb(void *state, uint8 enable);
 /*
 ** Stem extraction
 */
-void   EMU_CALL spu_set_stem_buf   (void *state, uint32 voice, sint16 *buf);
-void   EMU_CALL spu_clear_stem_bufs(void *state);
-uint32 EMU_CALL spu_get_voice_ssa  (void *state, uint32 voice);
-int    EMU_CALL spu_scan_samples   (void *state, uint32 *out_addrs, int max_addrs);
+void   EMU_CALL spu_set_stem_buf      (void *state, uint32 voice, sint16 *buf);
+void   EMU_CALL spu_clear_stem_bufs   (void *state);
+uint32 EMU_CALL spu_get_voice_ssa     (void *state, uint32 voice);
+uint32 EMU_CALL spu_get_voice_ssa_reg (void *state, uint32 voice);
+uint32 EMU_CALL spu_get_kon           (void *state);
+int    EMU_CALL spu_scan_samples      (void *state, uint32 *out_addrs, int max_addrs);
 
 #ifdef __cplusplus
 }

@@ -829,6 +829,15 @@ uint32 EMU_CALL spu_get_voice_ssa(void *state, uint32 voice) {
   return spucore_get_voice_ssa(CORESTATE(0), voice);
 }
 
+uint32 EMU_CALL spu_get_voice_ssa_reg(void *state, uint32 voice) {
+  if(voice >= 24) return 0xFFFFFFFF;
+  return spucore_getreg_voice(CORESTATE(0), voice, SPUREG_VOICE_SSA);
+}
+
+uint32 EMU_CALL spu_get_kon(void *state) {
+  return spucore_getreg(CORESTATE(0), SPUREG_KON);
+}
+
 int EMU_CALL spu_scan_samples(void *state, uint32 *out_addrs, int max_addrs) {
   uint32 reverb_start = spucore_getreg(CORESTATE(0), SPUREG_ESA);
   uint32 ramsize = (SPUSTATE->version == 2) ? 0x200000 : 0x80000;

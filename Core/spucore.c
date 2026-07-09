@@ -1763,7 +1763,7 @@ static void EMU_CALL render(struct SPUCORE_STATE *state, uint16 *ram, sint16 *bu
           sbuf[2*i+1] = (sint16)cr;
         }
       }
-      if(sbuf && r < samples) {
+      if(sbuf && r > 0 && r < samples) {
         memset(sbuf + 2*r, 0, 4*(samples-r));
       }
     }
@@ -1851,13 +1851,22 @@ static void EMU_CALL render(struct SPUCORE_STATE *state, uint16 *ram, sint16 *bu
 ** Externally-accessible renderer
 */
 void EMU_CALL spucore_render(void *state, uint16 *ram, sint16 *buf, sint16 *extinput, uint32 samples, uint8 mainout, uint8 effectout) {
+  int ch;
   while(samples > RENDERMAX) {
     samples -= RENDERMAX;
     render(SPUCORESTATE, ram, buf, extinput, RENDERMAX, mainout, effectout);
     if(buf     ) buf      += 2 * RENDERMAX;
     if(extinput) extinput += 2 * RENDERMAX;
+    for(ch = 0; ch < 24; ch++) {
+      if(SPUCORESTATE->stem_bufs[ch]) SPUCORESTATE->stem_bufs[ch] += 2 * RENDERMAX;
+    }
   }
-  if(samples) render(SPUCORESTATE, ram, buf, extinput, samples, mainout, effectout);
+  if(samples) {
+    render(SPUCORESTATE, ram, buf, extinput, samples, mainout, effectout);
+    for(ch = 0; ch < 24; ch++) {
+      if(SPUCORESTATE->stem_bufs[ch]) SPUCORESTATE->stem_bufs[ch] += 2 * samples;
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2122,6 +2131,11 @@ uint32 EMU_CALL spucore_cycles_until_interrupt(void *state, uint16 *ram, uint32 
   if (!backup) return 0xFFFFFFFF;
   memcpy(backup, state, spucore_get_state_size());
   state = backup;
+  /* Clear stem buf pointers in the backup: this is a lookahead render to find IRQ timing
+  ** (mainout=0, effectout=0, buf=NULL). Our render() modification would otherwise use
+  ** non-NULL stem_bufs to activate decoding and write speculatively into the caller's
+  ** pinned buffers, advancing past their bounds before actual rendering begins. */
+  { int i; for(i = 0; i < 24; i++) SPUCORESTATE->stem_bufs[i] = NULL; }
   SPUCORESTATE->irq_triggered_cycle = 0xFFFFFFFF;
   r = 0;
   while(samples > RENDERMAX) {
