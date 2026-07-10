@@ -844,6 +844,11 @@ int EMU_CALL spu_getflag(void *state, uint32 n) {
   return spucore_getflag(CORESTATE(0), n);
 }
 
+uint32 EMU_CALL spu_getreg_voice(void *state, uint32 voice, uint32 n) {
+  if(voice >= 24) return 0xFFFFFFFF;
+  return spucore_getreg_voice(CORESTATE(0), voice, n);
+}
+
 uint32 EMU_CALL spu_get_voice_ssa(void *state, uint32 voice) {
   return spucore_get_voice_ssa(CORESTATE(0), voice);
 }

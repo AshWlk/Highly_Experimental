@@ -42,6 +42,7 @@ void   EMU_CALL spu_set_reverb_buf    (void *state, sint16 *buf);
 void   EMU_CALL spu_clear_reverb_buf  (void *state);
 uint32 EMU_CALL spu_getreg            (void *state, uint32 n);
 int    EMU_CALL spu_getflag           (void *state, uint32 n);
+uint32 EMU_CALL spu_getreg_voice      (void *state, uint32 voice, uint32 n);
 uint32 EMU_CALL spu_get_voice_ssa     (void *state, uint32 voice);
 uint32 EMU_CALL spu_get_voice_ssa_reg (void *state, uint32 voice);
 uint32 EMU_CALL spu_get_kon           (void *state);
