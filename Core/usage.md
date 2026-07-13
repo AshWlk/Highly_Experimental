@@ -182,6 +182,88 @@ The library does not parse PSF tags or enforce track duration. You must:
 
 ---
 
+## Stem Extraction
+
+The SPU can write each voice's rendered audio — and the reverb return — into separate caller-supplied buffers while the normal mix proceeds unchanged. This lets you capture per-voice "stems" (e.g. for analysis or remixing) without modifying playback logic.
+
+### Setup
+
+Register buffers before calling `psx_execute()`. Each buffer must be large enough to hold `samples * 2` `sint16` values (stereo interleaved L/R):
+
+```c
+#include "spu.h"
+
+void *spu_state = psx_get_spu_state(state);  // obtain SPU substate
+
+sint16 voice0_buf[SAMPLES_PER_CALL * 2];
+sint16 reverb_buf[SAMPLES_PER_CALL * 2];
+
+// Register a stem buffer for voice 0
+spu_set_stem_buf(spu_state, 0, voice0_buf);
+
+// Register a buffer for the reverb return signal
+spu_set_reverb_buf(spu_state, reverb_buf);
+```
+
+After each `psx_execute()` call the buffers are filled and the pointers have been advanced by `samples_out * 2`. Reset them before the next call:
+
+```c
+spu_set_stem_buf(spu_state, 0, voice0_buf);
+spu_set_reverb_buf(spu_state, reverb_buf);
+```
+
+Or clear all at once to stop capturing:
+
+```c
+spu_clear_stem_bufs(spu_state);
+spu_clear_reverb_buf(spu_state);
+```
+
+### Inspecting Voice State
+
+```c
+// Read an SPU hardware register (see SPUREG_* constants in spucore.h)
+uint32_t val = spu_getreg(spu_state, SPUREG_KON);
+
+// Read the Key-On register directly
+uint32_t kon = spu_get_kon(spu_state);
+
+// Get the current sample start address (SSA) for a voice
+uint32_t ssa = spu_get_voice_ssa(spu_state, voice);
+
+// Get the SSA as stored in the hardware register
+uint32_t ssa_reg = spu_get_voice_ssa_reg(spu_state, voice);
+```
+
+### Scanning SPU RAM for Sample Blocks
+
+`spu_scan_samples()` walks SPU RAM up to the reverb work area and returns the start address of each ADPCM sample block (16-byte blocks identified by the loop-end flag in byte 1):
+
+```c
+uint32_t addrs[256];
+int count = spu_scan_samples(spu_state, addrs, 256);
+for (int i = 0; i < count; i++) {
+    printf("sample block at SPU RAM offset 0x%05X\n", addrs[i]);
+}
+```
+
+### Stem Extraction API
+
+| Function | Description |
+|---|---|
+| `spu_set_stem_buf(state, voice, buf)` | Register a per-voice stem buffer |
+| `spu_clear_stem_bufs(state)` | Clear all per-voice stem buffers |
+| `spu_set_reverb_buf(state, buf)` | Register a reverb return buffer |
+| `spu_clear_reverb_buf(state)` | Clear the reverb return buffer |
+| `spu_getreg(state, n)` | Read SPU register `n` from core 0 |
+| `spu_getflag(state, n)` | Read SPU flag `n` from core 0 |
+| `spu_get_voice_ssa(state, voice)` | Current sample start address for a voice |
+| `spu_get_voice_ssa_reg(state, voice)` | SSA as stored in the hardware register |
+| `spu_get_kon(state)` | Read the Key-On register |
+| `spu_scan_samples(state, out_addrs, max)` | Scan SPU RAM for ADPCM sample blocks |
+
+---
+
 ## Compilation Requirements
 
 All `.c` files must be compiled with `-DEMU_COMPILE` and one of:
