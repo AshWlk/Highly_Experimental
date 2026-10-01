@@ -10,6 +10,8 @@
 
 #include "spucore.h"
 
+#include <stddef.h>
+
 ////////////////////////////////////////////////////////////////////////////////
 /*
 ** Key-on defer
@@ -440,8 +442,7 @@ void EMU_CALL spucore_set_mem_size(void *state, uint32 size) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static void EMU_CALL make_safe_reverb_addresses(struct SPUCORE_STATE *state) {
-  struct SPUCORE_REVERB *r = &(state->reverb);
+static void EMU_CALL make_safe_reverb_addresses(struct SPUCORE_REVERB *r, sint32 memsize) {
   sint32 sa = r->start_address;
   sint32 ea = r->end_address;
 
@@ -451,7 +452,7 @@ static void EMU_CALL make_safe_reverb_addresses(struct SPUCORE_STATE *state) {
   ea &= (~0x1FFFF);
   sa &= (~1);
 
-  if(ea > state->memsize) ea = state->memsize;
+  if(ea > memsize) ea = memsize;
   if(ea < 0x20000) ea = 0x20000;
   if(sa > ea) {
     sa &= 0x1FFFE;
@@ -1223,9 +1224,9 @@ static void EMU_CALL render_noise(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#define MAKE_SINT32_COEF(x)   ((sint32)((sint16)(state->reverb.x)))
-#define MAKE_REVERB_OFFSET(x) (state->reverb.x)
-#define NORMALIZE_REVERB_OFFSET(x) {while(x>=state->reverb.safe_end_address){x-=state->reverb.safe_size;}while(x<state->reverb.safe_start_address){x+=state->reverb.safe_size;}}
+#define MAKE_SINT32_COEF(x)   ((sint32)((sint16)(rv->x)))
+#define MAKE_REVERB_OFFSET(x) ((sint32)(rv->x))
+#define NORMALIZE_REVERB_OFFSET(x) {while(x>=rv->safe_end_address){x-=rv->safe_size;}while(x<rv->safe_start_address){x+=rv->safe_size;}}
 
 #define RAM_PCM_SAMPLE(x) (*((sint16*)(((uint8*)ram) + (x))))
 #define RAM_SINT32_SAMPLE(x) ((sint32)(RAM_PCM_SAMPLE(x)))
@@ -1242,244 +1243,220 @@ static void EMU_CALL render_noise(
 //#define CLIP_PCMDBL_2(a,b) {CLIP_PCMDBL_1(a);CLIP_PCMDBL_1(b);}
 //#define CLIP_PCMDBL_4(a,b,c,d) {CLIP_PCMDBL_1(a);CLIP_PCMDBL_1(b);CLIP_PCMDBL_1(c);CLIP_PCMDBL_1(d);}
 
+/*
+** Reverb buffer address: current position plus a register offset, wrapped
+** into the work area
+*/
+#define REVERB_ADDRESS(dst,ofs) {dst=rv->current_address+(ofs);NORMALIZE_REVERB_OFFSET(dst);}
+
 ////////////////////////////////////////////////////////////////////////////////
 /*
-** 22KHz reverb steady state step
+** Reflection (IIR) step, shared by same-side and different-side reflections:
+**   [m] = (in + [d]*vWALL - [m-2])*vIIR + [m-2]
+** (in + [d]*vWALL) is saturated first, which keeps (x - prev)*vIIR within
+** 32 bits.
 */
-static void EMU_CALL reverb_steadystate22(struct SPUCORE_STATE *state, uint16 *ram, sint32 input_l, sint32 input_r) {
-  /*
-  ** Current reverb offset
-  */
-  sint32 current     = state->reverb.current_address;
+static EMU_INLINE sint32 EMU_CALL reverb_reflect(sint32 in, sint32 d, sint32 prev, sint32 v_wall, sint32 v_iir) {
+  sint32 x = in + ((d * v_wall) >> 15);
+  CLIP_PCM_1(x);
+  x = (((x - prev) * v_iir) >> 15) + prev;
+  CLIP_PCM_1(x);
+  return x;
+}
+
+/*
+** All-pass filter step:
+**   out = in - vAPF*[m-d], [m] = out, out = out*vAPF + [m-d]
+** The value to store at [m] is returned through mem.
+*/
+static EMU_INLINE sint32 EMU_CALL reverb_allpass(sint32 in, sint32 delayed, sint32 v_apf, sint32 *mem) {
+  sint32 x = in - ((delayed * v_apf) >> 15);
+  CLIP_PCM_1(x);
+  *mem = x;
+  x = ((x * v_apf) >> 15) + delayed;
+  CLIP_PCM_1(x);
+  return x;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/*
+** 22KHz reverb step
+**
+** Follows the nocash psx-spx reverb formula. Register names used below map
+** to the psx-spx names as follows:
+**   IN_COEF_L/R   = vLIN/vRIN      IIR_COEF   = vWALL     IIR_ALPHA = vIIR
+**   ACC_COEF_A..D = vCOMB1..4      FB_ALPHA   = vAPF1     FB_X      = vAPF2
+**   FB_SRC_A/B    = dAPF1/dAPF2
+**   IIR_DEST_A0/1 = mLSAME/mRSAME  IIR_SRC_A0/1 = dLSAME/dRSAME
+**   IIR_DEST_B0/1 = mLDIFF/mRDIFF  IIR_SRC_B1/0 = dLDIFF/dRDIFF (1F0h/1F2h)
+**   ACC_SRC_x0/1  = mLCOMBn/mRCOMBn
+**   MIX_DEST_A0/1 = mLAPF1/mRAPF1  MIX_DEST_B0/1 = mLAPF2/mRAPF2
+**
+** Buffer writes only happen when write_enable is set (SPU reverb master
+** enable); the output is always computed from the buffer contents.
+*/
+static void EMU_CALL reverb_step22(struct SPUCORE_REVERB *rv, uint16 *ram, int write_enable, sint32 *l, sint32 *r) {
   /*
   ** Reverb registers
   */
-  sint32 fb_src_a    = MAKE_REVERB_OFFSET(FB_SRC_A);
-  sint32 fb_src_b    = MAKE_REVERB_OFFSET(FB_SRC_B);
-  sint32 iir_alpha   = MAKE_SINT32_COEF(IIR_ALPHA);
-  sint32 acc_coef_a  = MAKE_SINT32_COEF(ACC_COEF_A);
-  sint32 acc_coef_b  = MAKE_SINT32_COEF(ACC_COEF_B);
-  sint32 acc_coef_c  = MAKE_SINT32_COEF(ACC_COEF_C);
-  sint32 acc_coef_d  = MAKE_SINT32_COEF(ACC_COEF_D);
-  sint32 iir_coef    = MAKE_SINT32_COEF(IIR_COEF);
-  sint32 fb_alpha    = MAKE_SINT32_COEF(FB_ALPHA);
-  sint32 fb_x        = MAKE_SINT32_COEF(FB_X);
-  sint32 iir_dest_a0 = MAKE_REVERB_OFFSET(IIR_DEST_A0);
-  sint32 iir_dest_a1 = MAKE_REVERB_OFFSET(IIR_DEST_A1);
-  sint32 acc_src_a0  = MAKE_REVERB_OFFSET(ACC_SRC_A0);
-  sint32 acc_src_a1  = MAKE_REVERB_OFFSET(ACC_SRC_A1);
-  sint32 acc_src_b0  = MAKE_REVERB_OFFSET(ACC_SRC_B0);
-  sint32 acc_src_b1  = MAKE_REVERB_OFFSET(ACC_SRC_B1);
-  sint32 iir_src_a0  = MAKE_REVERB_OFFSET(IIR_SRC_A0);
-  sint32 iir_src_a1  = MAKE_REVERB_OFFSET(IIR_SRC_A1);
-  sint32 iir_dest_b0 = MAKE_REVERB_OFFSET(IIR_DEST_B0);
-  sint32 iir_dest_b1 = MAKE_REVERB_OFFSET(IIR_DEST_B1);
-  sint32 acc_src_c0  = MAKE_REVERB_OFFSET(ACC_SRC_C0);
-  sint32 acc_src_c1  = MAKE_REVERB_OFFSET(ACC_SRC_C1);
-  sint32 acc_src_d0  = MAKE_REVERB_OFFSET(ACC_SRC_D0);
-  sint32 acc_src_d1  = MAKE_REVERB_OFFSET(ACC_SRC_D1);
-  sint32 iir_src_b1  = MAKE_REVERB_OFFSET(IIR_SRC_B1);
-  sint32 iir_src_b0  = MAKE_REVERB_OFFSET(IIR_SRC_B0);
-  sint32 mix_dest_a0 = MAKE_REVERB_OFFSET(MIX_DEST_A0);
-  sint32 mix_dest_a1 = MAKE_REVERB_OFFSET(MIX_DEST_A1);
-  sint32 mix_dest_b0 = MAKE_REVERB_OFFSET(MIX_DEST_B0);
-  sint32 mix_dest_b1 = MAKE_REVERB_OFFSET(MIX_DEST_B1);
-  sint32 in_coef_l   = MAKE_SINT32_COEF(IN_COEF_L);
-  sint32 in_coef_r   = MAKE_SINT32_COEF(IN_COEF_R);
+  sint32 v_lin   = MAKE_SINT32_COEF(IN_COEF_L);
+  sint32 v_rin   = MAKE_SINT32_COEF(IN_COEF_R);
+  sint32 v_wall  = MAKE_SINT32_COEF(IIR_COEF);
+  sint32 v_iir   = MAKE_SINT32_COEF(IIR_ALPHA);
+  sint32 v_comb1 = MAKE_SINT32_COEF(ACC_COEF_A);
+  sint32 v_comb2 = MAKE_SINT32_COEF(ACC_COEF_B);
+  sint32 v_comb3 = MAKE_SINT32_COEF(ACC_COEF_C);
+  sint32 v_comb4 = MAKE_SINT32_COEF(ACC_COEF_D);
+  sint32 v_apf1  = MAKE_SINT32_COEF(FB_ALPHA);
+  sint32 v_apf2  = MAKE_SINT32_COEF(FB_X);
   /*
-  ** Alternate buffer positions
+  ** Buffer addresses
   */
-  sint32 fb_src_a0;
-  sint32 fb_src_a1;
-  sint32 fb_src_b0;
-  sint32 fb_src_b1;
-  sint32 iir_dest_a0_plus;
-  sint32 iir_dest_a1_plus;
-  sint32 iir_dest_b0_plus;
-  sint32 iir_dest_b1_plus;
+  sint32 m_lsame, m_rsame, m_ldiff, m_rdiff;
+  sint32 m_lsame_prev, m_rsame_prev, m_ldiff_prev, m_rdiff_prev;
+  sint32 d_lsame, d_rsame, d_ldiff, d_rdiff;
+  sint32 m_lcomb1, m_lcomb2, m_lcomb3, m_lcomb4;
+  sint32 m_rcomb1, m_rcomb2, m_rcomb3, m_rcomb4;
+  sint32 m_lapf1, m_rapf1, m_lapf2, m_rapf2;
+  sint32 m_lapf1_d, m_rapf1_d, m_lapf2_d, m_rapf2_d;
   /*
   ** Intermediate results
   */
-  sint32 acc0;
-  sint32 acc1;
-  sint32 iir_input_a0;
-  sint32 iir_input_a1;
-  sint32 iir_input_b0;
-  sint32 iir_input_b1;
-  sint32 iir_a0;
-  sint32 iir_a1;
-  sint32 iir_b0;
-  sint32 iir_b1;
-  sint32 fb_a0;
-  sint32 fb_a1;
-  sint32 fb_b0;
-  sint32 fb_b1;
-  sint32 mix_a0;
-  sint32 mix_a1;
-  sint32 mix_b0;
-  sint32 mix_b1;
+  sint32 lin, rin;
+  sint32 lsame, rsame, ldiff, rdiff;
+  sint32 lout, rout;
+  sint32 lapf1, rapf1, lapf2, rapf2;
+
+  REVERB_ADDRESS(m_lsame,  MAKE_REVERB_OFFSET(IIR_DEST_A0));
+  REVERB_ADDRESS(m_rsame,  MAKE_REVERB_OFFSET(IIR_DEST_A1));
+  REVERB_ADDRESS(m_ldiff,  MAKE_REVERB_OFFSET(IIR_DEST_B0));
+  REVERB_ADDRESS(m_rdiff,  MAKE_REVERB_OFFSET(IIR_DEST_B1));
+  REVERB_ADDRESS(m_lsame_prev, MAKE_REVERB_OFFSET(IIR_DEST_A0) - 2);
+  REVERB_ADDRESS(m_rsame_prev, MAKE_REVERB_OFFSET(IIR_DEST_A1) - 2);
+  REVERB_ADDRESS(m_ldiff_prev, MAKE_REVERB_OFFSET(IIR_DEST_B0) - 2);
+  REVERB_ADDRESS(m_rdiff_prev, MAKE_REVERB_OFFSET(IIR_DEST_B1) - 2);
+  REVERB_ADDRESS(d_lsame,  MAKE_REVERB_OFFSET(IIR_SRC_A0));
+  REVERB_ADDRESS(d_rsame,  MAKE_REVERB_OFFSET(IIR_SRC_A1));
+  REVERB_ADDRESS(d_ldiff,  MAKE_REVERB_OFFSET(IIR_SRC_B1));
+  REVERB_ADDRESS(d_rdiff,  MAKE_REVERB_OFFSET(IIR_SRC_B0));
+  REVERB_ADDRESS(m_lcomb1, MAKE_REVERB_OFFSET(ACC_SRC_A0));
+  REVERB_ADDRESS(m_lcomb2, MAKE_REVERB_OFFSET(ACC_SRC_B0));
+  REVERB_ADDRESS(m_lcomb3, MAKE_REVERB_OFFSET(ACC_SRC_C0));
+  REVERB_ADDRESS(m_lcomb4, MAKE_REVERB_OFFSET(ACC_SRC_D0));
+  REVERB_ADDRESS(m_rcomb1, MAKE_REVERB_OFFSET(ACC_SRC_A1));
+  REVERB_ADDRESS(m_rcomb2, MAKE_REVERB_OFFSET(ACC_SRC_B1));
+  REVERB_ADDRESS(m_rcomb3, MAKE_REVERB_OFFSET(ACC_SRC_C1));
+  REVERB_ADDRESS(m_rcomb4, MAKE_REVERB_OFFSET(ACC_SRC_D1));
+  REVERB_ADDRESS(m_lapf1,  MAKE_REVERB_OFFSET(MIX_DEST_A0));
+  REVERB_ADDRESS(m_rapf1,  MAKE_REVERB_OFFSET(MIX_DEST_A1));
+  REVERB_ADDRESS(m_lapf2,  MAKE_REVERB_OFFSET(MIX_DEST_B0));
+  REVERB_ADDRESS(m_rapf2,  MAKE_REVERB_OFFSET(MIX_DEST_B1));
+  REVERB_ADDRESS(m_lapf1_d, MAKE_REVERB_OFFSET(MIX_DEST_A0) - MAKE_REVERB_OFFSET(FB_SRC_A));
+  REVERB_ADDRESS(m_rapf1_d, MAKE_REVERB_OFFSET(MIX_DEST_A1) - MAKE_REVERB_OFFSET(FB_SRC_A));
+  REVERB_ADDRESS(m_lapf2_d, MAKE_REVERB_OFFSET(MIX_DEST_B0) - MAKE_REVERB_OFFSET(FB_SRC_B));
+  REVERB_ADDRESS(m_rapf2_d, MAKE_REVERB_OFFSET(MIX_DEST_B1) - MAKE_REVERB_OFFSET(FB_SRC_B));
 
   /*
-  ** Offsets
+  ** Input from mixer
   */
-  mix_dest_a0 += current; NORMALIZE_REVERB_OFFSET(mix_dest_a0);
-  mix_dest_a1 += current; NORMALIZE_REVERB_OFFSET(mix_dest_a1);
-  mix_dest_b0 += current; NORMALIZE_REVERB_OFFSET(mix_dest_b0);
-  mix_dest_b1 += current; NORMALIZE_REVERB_OFFSET(mix_dest_b1);
-  fb_src_a0 = mix_dest_a0 - fb_src_a; NORMALIZE_REVERB_OFFSET(fb_src_a0);
-  fb_src_a1 = mix_dest_a1 - fb_src_a; NORMALIZE_REVERB_OFFSET(fb_src_a1);
-  fb_src_b0 = mix_dest_b0 - fb_src_b; NORMALIZE_REVERB_OFFSET(fb_src_b0);
-  fb_src_b1 = mix_dest_b1 - fb_src_b; NORMALIZE_REVERB_OFFSET(fb_src_b1);
-  acc_src_a0 += current; NORMALIZE_REVERB_OFFSET(acc_src_a0);
-  acc_src_a1 += current; NORMALIZE_REVERB_OFFSET(acc_src_a1);
-  acc_src_b0 += current; NORMALIZE_REVERB_OFFSET(acc_src_b0);
-  acc_src_b1 += current; NORMALIZE_REVERB_OFFSET(acc_src_b1);
-  acc_src_c0 += current; NORMALIZE_REVERB_OFFSET(acc_src_c0);
-  acc_src_c1 += current; NORMALIZE_REVERB_OFFSET(acc_src_c1);
-  acc_src_d0 += current; NORMALIZE_REVERB_OFFSET(acc_src_d0);
-  acc_src_d1 += current; NORMALIZE_REVERB_OFFSET(acc_src_d1);
-  iir_src_a0 += current; NORMALIZE_REVERB_OFFSET(iir_src_a0);
-  iir_src_a1 += current; NORMALIZE_REVERB_OFFSET(iir_src_a1);
-  iir_src_b0 += current; NORMALIZE_REVERB_OFFSET(iir_src_b0);
-  iir_src_b1 += current; NORMALIZE_REVERB_OFFSET(iir_src_b1);
-  iir_dest_a0 += current; NORMALIZE_REVERB_OFFSET(iir_dest_a0);
-  iir_dest_a1 += current; NORMALIZE_REVERB_OFFSET(iir_dest_a1);
-  iir_dest_b0 += current; NORMALIZE_REVERB_OFFSET(iir_dest_b0);
-  iir_dest_b1 += current; NORMALIZE_REVERB_OFFSET(iir_dest_b1);
-  iir_dest_a0_plus = iir_dest_a0 + 2; NORMALIZE_REVERB_OFFSET(iir_dest_a0_plus);
-  iir_dest_a1_plus = iir_dest_a1 + 2; NORMALIZE_REVERB_OFFSET(iir_dest_a1_plus);
-  iir_dest_b0_plus = iir_dest_b0 + 2; NORMALIZE_REVERB_OFFSET(iir_dest_b0_plus);
-  iir_dest_b1_plus = iir_dest_b1 + 2; NORMALIZE_REVERB_OFFSET(iir_dest_b1_plus);
+  lin = *l;
+  rin = *r;
+  CLIP_PCM_2(lin,rin);
+  lin = (lin * v_lin) >> 15;
+  rin = (rin * v_rin) >> 15;
 
   /*
-  ** IIR
+  ** Same side reflection (L-to-L, R-to-R)
   */
-  CLIP_PCM_2(input_l,input_r);
-  input_l *= in_coef_l;
-  input_r *= in_coef_r;
-#define OPPOSITE_IIR_ALPHA (32768-iir_alpha)
-  iir_input_a0 = ((RAM_SINT32_SAMPLE(iir_src_a0) * iir_coef) + input_l) >> 15;
-  iir_input_a1 = ((RAM_SINT32_SAMPLE(iir_src_a1) * iir_coef) + input_r) >> 15;
-  iir_input_b0 = ((RAM_SINT32_SAMPLE(iir_src_b0) * iir_coef) + input_l) >> 15;
-  iir_input_b1 = ((RAM_SINT32_SAMPLE(iir_src_b1) * iir_coef) + input_r) >> 15;
-  CLIP_PCM_4(iir_input_a0,iir_input_a1,iir_input_b0,iir_input_b1);
-  iir_a0 = ((iir_input_a0 * iir_alpha) + (RAM_SINT32_SAMPLE(iir_dest_a0) * (OPPOSITE_IIR_ALPHA))) >> 15;
-  iir_a1 = ((iir_input_a1 * iir_alpha) + (RAM_SINT32_SAMPLE(iir_dest_a1) * (OPPOSITE_IIR_ALPHA))) >> 15;
-  iir_b0 = ((iir_input_b0 * iir_alpha) + (RAM_SINT32_SAMPLE(iir_dest_b0) * (OPPOSITE_IIR_ALPHA))) >> 15;
-  iir_b1 = ((iir_input_b1 * iir_alpha) + (RAM_SINT32_SAMPLE(iir_dest_b1) * (OPPOSITE_IIR_ALPHA))) >> 15;
-  CLIP_PCM_4(iir_a0,iir_a1,iir_b0,iir_b1);
-
-  RAM_PCM_SAMPLE(iir_dest_a0_plus) = iir_a0;
-  RAM_PCM_SAMPLE(iir_dest_a1_plus) = iir_a1;
-  RAM_PCM_SAMPLE(iir_dest_b0_plus) = iir_b0;
-  RAM_PCM_SAMPLE(iir_dest_b1_plus) = iir_b1;
+  lsame = reverb_reflect(lin, RAM_SINT32_SAMPLE(d_lsame), RAM_SINT32_SAMPLE(m_lsame_prev), v_wall, v_iir);
+  rsame = reverb_reflect(rin, RAM_SINT32_SAMPLE(d_rsame), RAM_SINT32_SAMPLE(m_rsame_prev), v_wall, v_iir);
+  if(write_enable) {
+    RAM_PCM_SAMPLE(m_lsame) = lsame;
+    RAM_PCM_SAMPLE(m_rsame) = rsame;
+  }
 
   /*
-  ** Accumulators
+  ** Different side reflection (R-to-L, L-to-R)
   */
-  acc0 =
-    ((RAM_SINT32_SAMPLE(acc_src_a0) * acc_coef_a) >> 15) +
-    ((RAM_SINT32_SAMPLE(acc_src_b0) * acc_coef_b) >> 15) +
-    ((RAM_SINT32_SAMPLE(acc_src_c0) * acc_coef_c) >> 15) +
-    ((RAM_SINT32_SAMPLE(acc_src_d0) * acc_coef_d) >> 15);
-  acc1 =
-    ((RAM_SINT32_SAMPLE(acc_src_a1) * acc_coef_a) >> 15) +
-    ((RAM_SINT32_SAMPLE(acc_src_b1) * acc_coef_b) >> 15) +
-    ((RAM_SINT32_SAMPLE(acc_src_c1) * acc_coef_c) >> 15) +
-    ((RAM_SINT32_SAMPLE(acc_src_d1) * acc_coef_d) >> 15);
-  CLIP_PCM_2(acc0,acc1);
+  ldiff = reverb_reflect(lin, RAM_SINT32_SAMPLE(d_rdiff), RAM_SINT32_SAMPLE(m_ldiff_prev), v_wall, v_iir);
+  rdiff = reverb_reflect(rin, RAM_SINT32_SAMPLE(d_ldiff), RAM_SINT32_SAMPLE(m_rdiff_prev), v_wall, v_iir);
+  if(write_enable) {
+    RAM_PCM_SAMPLE(m_ldiff) = ldiff;
+    RAM_PCM_SAMPLE(m_rdiff) = rdiff;
+  }
 
   /*
-  ** Feedback
+  ** Early echo (comb filter)
   */
-  fb_a0 = RAM_SINT32_SAMPLE(fb_src_a0);
-  fb_a1 = RAM_SINT32_SAMPLE(fb_src_a1);
-  fb_b0 = RAM_SINT32_SAMPLE(fb_src_b0);
-  fb_b1 = RAM_SINT32_SAMPLE(fb_src_b1);
+  lout =
+    ((RAM_SINT32_SAMPLE(m_lcomb1) * v_comb1) >> 15) +
+    ((RAM_SINT32_SAMPLE(m_lcomb2) * v_comb2) >> 15) +
+    ((RAM_SINT32_SAMPLE(m_lcomb3) * v_comb3) >> 15) +
+    ((RAM_SINT32_SAMPLE(m_lcomb4) * v_comb4) >> 15);
+  rout =
+    ((RAM_SINT32_SAMPLE(m_rcomb1) * v_comb1) >> 15) +
+    ((RAM_SINT32_SAMPLE(m_rcomb2) * v_comb2) >> 15) +
+    ((RAM_SINT32_SAMPLE(m_rcomb3) * v_comb3) >> 15) +
+    ((RAM_SINT32_SAMPLE(m_rcomb4) * v_comb4) >> 15);
+  CLIP_PCM_2(lout,rout);
 
-  mix_a0 = acc0 - ((fb_a0*fb_alpha)>>15);
-  mix_a1 = acc1 - ((fb_a1*fb_alpha)>>15);
-  mix_b0 = fb_alpha*acc0;
-  mix_b1 = fb_alpha*acc1;
-  fb_alpha = ((sint32)((sint16)(((sint16)fb_alpha)^0x8000)));
-  mix_b0 -= fb_a0*fb_alpha;
-  mix_b1 -= fb_a1*fb_alpha;
-  mix_b0 -= fb_b0*fb_x;
-  mix_b1 -= fb_b1*fb_x;
-  mix_b0>>=15;
-  mix_b1>>=15;
+  /*
+  ** Late reverb APF1 (input from comb)
+  */
+  lout = reverb_allpass(lout, RAM_SINT32_SAMPLE(m_lapf1_d), v_apf1, &lapf1);
+  rout = reverb_allpass(rout, RAM_SINT32_SAMPLE(m_rapf1_d), v_apf1, &rapf1);
+  if(write_enable) {
+    RAM_PCM_SAMPLE(m_lapf1) = lapf1;
+    RAM_PCM_SAMPLE(m_rapf1) = rapf1;
+  }
 
-  CLIP_PCM_4(mix_a0,mix_a1,mix_b0,mix_b1);
-  RAM_PCM_SAMPLE(mix_dest_a0) = mix_a0;
-  RAM_PCM_SAMPLE(mix_dest_a1) = mix_a1;
-  RAM_PCM_SAMPLE(mix_dest_b0) = mix_b0;
-  RAM_PCM_SAMPLE(mix_dest_b1) = mix_b1;
+  /*
+  ** Late reverb APF2 (input from APF1)
+  */
+  lout = reverb_allpass(lout, RAM_SINT32_SAMPLE(m_lapf2_d), v_apf2, &lapf2);
+  rout = reverb_allpass(rout, RAM_SINT32_SAMPLE(m_rapf2_d), v_apf2, &rapf2);
+  if(write_enable) {
+    RAM_PCM_SAMPLE(m_lapf2) = lapf2;
+    RAM_PCM_SAMPLE(m_rapf2) = rapf2;
+  }
 
+  /*
+  ** Output to mixer (EVOL is applied by the caller)
+  */
+  *l = lout;
+  *r = rout;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 /*
 ** 22KHz reverb engine
 */
-static void EMU_CALL reverb_engine22(struct SPUCORE_STATE *state, uint16 *ram, sint32 *l, sint32 *r) {
-  sint32 input_l = *l;
-  sint32 input_r = *r;
-  sint32 output_l;
-  sint32 output_r;
-  sint32 mix_dest_a0 = state->reverb.current_address + MAKE_REVERB_OFFSET(MIX_DEST_A0);
-  sint32 mix_dest_a1 = state->reverb.current_address + MAKE_REVERB_OFFSET(MIX_DEST_A1);
-  sint32 mix_dest_b0 = state->reverb.current_address + MAKE_REVERB_OFFSET(MIX_DEST_B0);
-  sint32 mix_dest_b1 = state->reverb.current_address + MAKE_REVERB_OFFSET(MIX_DEST_B1);
-  NORMALIZE_REVERB_OFFSET(mix_dest_a0);
-  NORMALIZE_REVERB_OFFSET(mix_dest_a1);
-  NORMALIZE_REVERB_OFFSET(mix_dest_b0);
-  NORMALIZE_REVERB_OFFSET(mix_dest_b1);
-
+static void EMU_CALL reverb_engine22(struct SPUCORE_REVERB *rv, uint16 *ram, int write_enable, sint32 *l, sint32 *r) {
   /*
-  ** (Scale these down for now - avoids some clipping)
+  ** Degenerate work area - nothing to address
   */
-  input_l *= 2;
-  input_r *= 2;
-  input_l /= 3;
-  input_r /= 3;
-
-  /*
-  ** Execute steady state step if necessary
-  */
-  if(state->flags & SPUREG_FLAG_REVERB_ENABLE) {
-    reverb_steadystate22(state, ram, input_l, input_r);
+  if(rv->safe_size <= 0) {
+    *l = 0;
+    *r = 0;
+    return;
   }
 
-  /*
-  ** Retrieve wet out L/R
-  ** (pretty certain this is done AFTER the steady state step)
-  */
-  {
-    int al = RAM_SINT32_SAMPLE(mix_dest_a0);
-    int ar = RAM_SINT32_SAMPLE(mix_dest_a1);
-    int bl = RAM_SINT32_SAMPLE(mix_dest_b0);
-    int br = RAM_SINT32_SAMPLE(mix_dest_b1);
-
-    output_l = al + bl;
-    output_r = ar + br;
-  }
-
-  *l = output_l;
-  *r = output_r;
+  reverb_step22(rv, ram, write_enable, l, r);
 
   /*
   ** Advance reverb buffer position
+  ** (BufferAddress = MAX(ESA, (BufferAddress+2) AND end-of-RAM))
   */
-  state->reverb.current_address += 2;
-  if(state->reverb.current_address >= state->reverb.safe_end_address) {
-    state->reverb.current_address = state->reverb.safe_start_address;
+  rv->current_address += 2;
+  if(rv->current_address >= rv->safe_end_address) {
+    rv->current_address = rv->safe_start_address;
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static void EMU_CALL reverb_process(struct SPUCORE_STATE *state, uint16 *ram, sint32 *buf, int samples) {
-  int q = state->reverb.resampler.queue_index;
+static void EMU_CALL reverb_process(struct SPUCORE_REVERB *rv, uint16 *ram, int write_enable, sint32 *buf, int samples) {
+  int q = rv->resampler.queue_index;
   /*
   ** Sample loop
   */
@@ -1492,8 +1469,8 @@ static void EMU_CALL reverb_process(struct SPUCORE_STATE *state, uint16 *ram, si
     /*
     ** Put it in the input queue
     */
-    state->reverb.resampler.in_queue_l[q & 63] = l;
-    state->reverb.resampler.in_queue_r[q & 63] = r;
+    rv->resampler.in_queue_l[q & 63] = l;
+    rv->resampler.in_queue_r[q & 63] = r;
     /*
     ** If we're ready to create another output sample...
     */
@@ -1503,72 +1480,72 @@ static void EMU_CALL reverb_process(struct SPUCORE_STATE *state, uint16 *ram, si
       */
 #if 1
       l =
-        (state->reverb.resampler.in_queue_l[(q - 38) & 63]) * reverb_psx_lowpass_coefs[0] +
-        (state->reverb.resampler.in_queue_l[(q - 36) & 63]) * reverb_psx_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_l[(q - 34) & 63]) * reverb_psx_lowpass_coefs[2] +
-        (state->reverb.resampler.in_queue_l[(q - 32) & 63]) * reverb_psx_lowpass_coefs[3] +
-        (state->reverb.resampler.in_queue_l[(q - 30) & 63]) * reverb_psx_lowpass_coefs[4] +
-        (state->reverb.resampler.in_queue_l[(q - 28) & 63]) * reverb_psx_lowpass_coefs[5] +
-        (state->reverb.resampler.in_queue_l[(q - 26) & 63]) * reverb_psx_lowpass_coefs[6] +
-        (state->reverb.resampler.in_queue_l[(q - 24) & 63]) * reverb_psx_lowpass_coefs[7] +
-        (state->reverb.resampler.in_queue_l[(q - 22) & 63]) * reverb_psx_lowpass_coefs[8] +
-        (state->reverb.resampler.in_queue_l[(q - 20) & 63]) * reverb_psx_lowpass_coefs[9] +
-        (state->reverb.resampler.in_queue_l[(q - 19) & 63]) * reverb_psx_lowpass_coefs[10] +
-        (state->reverb.resampler.in_queue_l[(q - 18) & 63]) * reverb_psx_lowpass_coefs[9] +
-        (state->reverb.resampler.in_queue_l[(q - 16) & 63]) * reverb_psx_lowpass_coefs[8] +
-        (state->reverb.resampler.in_queue_l[(q - 14) & 63]) * reverb_psx_lowpass_coefs[7] +
-        (state->reverb.resampler.in_queue_l[(q - 12) & 63]) * reverb_psx_lowpass_coefs[6] +
-        (state->reverb.resampler.in_queue_l[(q - 10) & 63]) * reverb_psx_lowpass_coefs[5] +
-        (state->reverb.resampler.in_queue_l[(q - 8) & 63]) * reverb_psx_lowpass_coefs[4] +
-        (state->reverb.resampler.in_queue_l[(q - 6) & 63]) * reverb_psx_lowpass_coefs[3] +
-        (state->reverb.resampler.in_queue_l[(q - 4) & 63]) * reverb_psx_lowpass_coefs[2] +
-        (state->reverb.resampler.in_queue_l[(q - 2) & 63]) * reverb_psx_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_l[(q - 0) & 63]) * reverb_psx_lowpass_coefs[0];
+        (rv->resampler.in_queue_l[(q - 38) & 63]) * reverb_psx_lowpass_coefs[0] +
+        (rv->resampler.in_queue_l[(q - 36) & 63]) * reverb_psx_lowpass_coefs[1] +
+        (rv->resampler.in_queue_l[(q - 34) & 63]) * reverb_psx_lowpass_coefs[2] +
+        (rv->resampler.in_queue_l[(q - 32) & 63]) * reverb_psx_lowpass_coefs[3] +
+        (rv->resampler.in_queue_l[(q - 30) & 63]) * reverb_psx_lowpass_coefs[4] +
+        (rv->resampler.in_queue_l[(q - 28) & 63]) * reverb_psx_lowpass_coefs[5] +
+        (rv->resampler.in_queue_l[(q - 26) & 63]) * reverb_psx_lowpass_coefs[6] +
+        (rv->resampler.in_queue_l[(q - 24) & 63]) * reverb_psx_lowpass_coefs[7] +
+        (rv->resampler.in_queue_l[(q - 22) & 63]) * reverb_psx_lowpass_coefs[8] +
+        (rv->resampler.in_queue_l[(q - 20) & 63]) * reverb_psx_lowpass_coefs[9] +
+        (rv->resampler.in_queue_l[(q - 19) & 63]) * reverb_psx_lowpass_coefs[10] +
+        (rv->resampler.in_queue_l[(q - 18) & 63]) * reverb_psx_lowpass_coefs[9] +
+        (rv->resampler.in_queue_l[(q - 16) & 63]) * reverb_psx_lowpass_coefs[8] +
+        (rv->resampler.in_queue_l[(q - 14) & 63]) * reverb_psx_lowpass_coefs[7] +
+        (rv->resampler.in_queue_l[(q - 12) & 63]) * reverb_psx_lowpass_coefs[6] +
+        (rv->resampler.in_queue_l[(q - 10) & 63]) * reverb_psx_lowpass_coefs[5] +
+        (rv->resampler.in_queue_l[(q - 8) & 63]) * reverb_psx_lowpass_coefs[4] +
+        (rv->resampler.in_queue_l[(q - 6) & 63]) * reverb_psx_lowpass_coefs[3] +
+        (rv->resampler.in_queue_l[(q - 4) & 63]) * reverb_psx_lowpass_coefs[2] +
+        (rv->resampler.in_queue_l[(q - 2) & 63]) * reverb_psx_lowpass_coefs[1] +
+        (rv->resampler.in_queue_l[(q - 0) & 63]) * reverb_psx_lowpass_coefs[0];
       r =
-        (state->reverb.resampler.in_queue_r[(q - 38) & 63]) * reverb_psx_lowpass_coefs[0] +
-        (state->reverb.resampler.in_queue_r[(q - 36) & 63]) * reverb_psx_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_r[(q - 34) & 63]) * reverb_psx_lowpass_coefs[2] +
-        (state->reverb.resampler.in_queue_r[(q - 32) & 63]) * reverb_psx_lowpass_coefs[3] +
-        (state->reverb.resampler.in_queue_r[(q - 30) & 63]) * reverb_psx_lowpass_coefs[4] +
-        (state->reverb.resampler.in_queue_r[(q - 28) & 63]) * reverb_psx_lowpass_coefs[5] +
-        (state->reverb.resampler.in_queue_r[(q - 26) & 63]) * reverb_psx_lowpass_coefs[6] +
-        (state->reverb.resampler.in_queue_r[(q - 24) & 63]) * reverb_psx_lowpass_coefs[7] +
-        (state->reverb.resampler.in_queue_r[(q - 22) & 63]) * reverb_psx_lowpass_coefs[8] +
-        (state->reverb.resampler.in_queue_r[(q - 20) & 63]) * reverb_psx_lowpass_coefs[9] +
-        (state->reverb.resampler.in_queue_r[(q - 19) & 63]) * reverb_psx_lowpass_coefs[10] +
-        (state->reverb.resampler.in_queue_r[(q - 18) & 63]) * reverb_psx_lowpass_coefs[9] +
-        (state->reverb.resampler.in_queue_r[(q - 16) & 63]) * reverb_psx_lowpass_coefs[8] +
-        (state->reverb.resampler.in_queue_r[(q - 14) & 63]) * reverb_psx_lowpass_coefs[7] +
-        (state->reverb.resampler.in_queue_r[(q - 12) & 63]) * reverb_psx_lowpass_coefs[6] +
-        (state->reverb.resampler.in_queue_r[(q - 10) & 63]) * reverb_psx_lowpass_coefs[5] +
-        (state->reverb.resampler.in_queue_r[(q - 8) & 63]) * reverb_psx_lowpass_coefs[4] +
-        (state->reverb.resampler.in_queue_r[(q - 6) & 63]) * reverb_psx_lowpass_coefs[3] +
-        (state->reverb.resampler.in_queue_r[(q - 4) & 63]) * reverb_psx_lowpass_coefs[2] +
-        (state->reverb.resampler.in_queue_r[(q - 2) & 63]) * reverb_psx_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_r[(q - 0) & 63]) * reverb_psx_lowpass_coefs[0];
+        (rv->resampler.in_queue_r[(q - 38) & 63]) * reverb_psx_lowpass_coefs[0] +
+        (rv->resampler.in_queue_r[(q - 36) & 63]) * reverb_psx_lowpass_coefs[1] +
+        (rv->resampler.in_queue_r[(q - 34) & 63]) * reverb_psx_lowpass_coefs[2] +
+        (rv->resampler.in_queue_r[(q - 32) & 63]) * reverb_psx_lowpass_coefs[3] +
+        (rv->resampler.in_queue_r[(q - 30) & 63]) * reverb_psx_lowpass_coefs[4] +
+        (rv->resampler.in_queue_r[(q - 28) & 63]) * reverb_psx_lowpass_coefs[5] +
+        (rv->resampler.in_queue_r[(q - 26) & 63]) * reverb_psx_lowpass_coefs[6] +
+        (rv->resampler.in_queue_r[(q - 24) & 63]) * reverb_psx_lowpass_coefs[7] +
+        (rv->resampler.in_queue_r[(q - 22) & 63]) * reverb_psx_lowpass_coefs[8] +
+        (rv->resampler.in_queue_r[(q - 20) & 63]) * reverb_psx_lowpass_coefs[9] +
+        (rv->resampler.in_queue_r[(q - 19) & 63]) * reverb_psx_lowpass_coefs[10] +
+        (rv->resampler.in_queue_r[(q - 18) & 63]) * reverb_psx_lowpass_coefs[9] +
+        (rv->resampler.in_queue_r[(q - 16) & 63]) * reverb_psx_lowpass_coefs[8] +
+        (rv->resampler.in_queue_r[(q - 14) & 63]) * reverb_psx_lowpass_coefs[7] +
+        (rv->resampler.in_queue_r[(q - 12) & 63]) * reverb_psx_lowpass_coefs[6] +
+        (rv->resampler.in_queue_r[(q - 10) & 63]) * reverb_psx_lowpass_coefs[5] +
+        (rv->resampler.in_queue_r[(q - 8) & 63]) * reverb_psx_lowpass_coefs[4] +
+        (rv->resampler.in_queue_r[(q - 6) & 63]) * reverb_psx_lowpass_coefs[3] +
+        (rv->resampler.in_queue_r[(q - 4) & 63]) * reverb_psx_lowpass_coefs[2] +
+        (rv->resampler.in_queue_r[(q - 2) & 63]) * reverb_psx_lowpass_coefs[1] +
+        (rv->resampler.in_queue_r[(q - 0) & 63]) * reverb_psx_lowpass_coefs[0];
 #else
       l = 0;
       r = 0;
 
       for (n = 47; n >= 0; n -= 8) {
         l +=
-          (state->reverb.resampler.in_queue_l[(q - n + 0) & 63]) * reverb_psx_lowpass_coefs[n - 0] +
-          (state->reverb.resampler.in_queue_l[(q - n + 1) & 63]) * reverb_psx_lowpass_coefs[n - 1] +
-          (state->reverb.resampler.in_queue_l[(q - n + 2) & 63]) * reverb_psx_lowpass_coefs[n - 2] +
-          (state->reverb.resampler.in_queue_l[(q - n + 3) & 63]) * reverb_psx_lowpass_coefs[n - 3] +
-          (state->reverb.resampler.in_queue_l[(q - n + 4) & 63]) * reverb_psx_lowpass_coefs[n - 4] +
-          (state->reverb.resampler.in_queue_l[(q - n + 5) & 63]) * reverb_psx_lowpass_coefs[n - 5] +
-          (state->reverb.resampler.in_queue_l[(q - n + 6) & 63]) * reverb_psx_lowpass_coefs[n - 6] +
-          (state->reverb.resampler.in_queue_l[(q - n + 7) & 63]) * reverb_psx_lowpass_coefs[n - 7];
+          (rv->resampler.in_queue_l[(q - n + 0) & 63]) * reverb_psx_lowpass_coefs[n - 0] +
+          (rv->resampler.in_queue_l[(q - n + 1) & 63]) * reverb_psx_lowpass_coefs[n - 1] +
+          (rv->resampler.in_queue_l[(q - n + 2) & 63]) * reverb_psx_lowpass_coefs[n - 2] +
+          (rv->resampler.in_queue_l[(q - n + 3) & 63]) * reverb_psx_lowpass_coefs[n - 3] +
+          (rv->resampler.in_queue_l[(q - n + 4) & 63]) * reverb_psx_lowpass_coefs[n - 4] +
+          (rv->resampler.in_queue_l[(q - n + 5) & 63]) * reverb_psx_lowpass_coefs[n - 5] +
+          (rv->resampler.in_queue_l[(q - n + 6) & 63]) * reverb_psx_lowpass_coefs[n - 6] +
+          (rv->resampler.in_queue_l[(q - n + 7) & 63]) * reverb_psx_lowpass_coefs[n - 7];
         r +=
-          (state->reverb.resampler.in_queue_r[(q - n + 0) & 63]) * reverb_psx_lowpass_coefs[n - 0] +
-          (state->reverb.resampler.in_queue_r[(q - n + 1) & 63]) * reverb_psx_lowpass_coefs[n - 1] +
-          (state->reverb.resampler.in_queue_r[(q - n + 2) & 63]) * reverb_psx_lowpass_coefs[n - 2] +
-          (state->reverb.resampler.in_queue_r[(q - n + 3) & 63]) * reverb_psx_lowpass_coefs[n - 3] +
-          (state->reverb.resampler.in_queue_r[(q - n + 4) & 63]) * reverb_psx_lowpass_coefs[n - 4] +
-          (state->reverb.resampler.in_queue_r[(q - n + 5) & 63]) * reverb_psx_lowpass_coefs[n - 5] +
-          (state->reverb.resampler.in_queue_r[(q - n + 6) & 63]) * reverb_psx_lowpass_coefs[n - 6] +
-          (state->reverb.resampler.in_queue_r[(q - n + 7) & 63]) * reverb_psx_lowpass_coefs[n - 7];
+          (rv->resampler.in_queue_r[(q - n + 0) & 63]) * reverb_psx_lowpass_coefs[n - 0] +
+          (rv->resampler.in_queue_r[(q - n + 1) & 63]) * reverb_psx_lowpass_coefs[n - 1] +
+          (rv->resampler.in_queue_r[(q - n + 2) & 63]) * reverb_psx_lowpass_coefs[n - 2] +
+          (rv->resampler.in_queue_r[(q - n + 3) & 63]) * reverb_psx_lowpass_coefs[n - 3] +
+          (rv->resampler.in_queue_r[(q - n + 4) & 63]) * reverb_psx_lowpass_coefs[n - 4] +
+          (rv->resampler.in_queue_r[(q - n + 5) & 63]) * reverb_psx_lowpass_coefs[n - 5] +
+          (rv->resampler.in_queue_r[(q - n + 6) & 63]) * reverb_psx_lowpass_coefs[n - 6] +
+          (rv->resampler.in_queue_r[(q - n + 7) & 63]) * reverb_psx_lowpass_coefs[n - 7];
       }
 #endif
 
@@ -1577,32 +1554,32 @@ static void EMU_CALL reverb_process(struct SPUCORE_STATE *state, uint16 *ram, si
 
 /*
       l =
-        (state->reverb.resampler.in_queue_l[(q - 6) & 7]) * reverb_new_lowpass_coefs[0] +
-        (state->reverb.resampler.in_queue_l[(q - 4) & 7]) * reverb_new_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_l[(q - 3) & 7]) * reverb_new_lowpass_coefs[2] +
-        (state->reverb.resampler.in_queue_l[(q - 2) & 7]) * reverb_new_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_l[(q - 0) & 7]) * reverb_new_lowpass_coefs[0];
+        (rv->resampler.in_queue_l[(q - 6) & 7]) * reverb_new_lowpass_coefs[0] +
+        (rv->resampler.in_queue_l[(q - 4) & 7]) * reverb_new_lowpass_coefs[1] +
+        (rv->resampler.in_queue_l[(q - 3) & 7]) * reverb_new_lowpass_coefs[2] +
+        (rv->resampler.in_queue_l[(q - 2) & 7]) * reverb_new_lowpass_coefs[1] +
+        (rv->resampler.in_queue_l[(q - 0) & 7]) * reverb_new_lowpass_coefs[0];
       l >>= 11;
       r =
-        (state->reverb.resampler.in_queue_r[(q - 6) & 7]) * reverb_new_lowpass_coefs[0] +
-        (state->reverb.resampler.in_queue_r[(q - 4) & 7]) * reverb_new_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_r[(q - 3) & 7]) * reverb_new_lowpass_coefs[2] +
-        (state->reverb.resampler.in_queue_r[(q - 2) & 7]) * reverb_new_lowpass_coefs[1] +
-        (state->reverb.resampler.in_queue_r[(q - 0) & 7]) * reverb_new_lowpass_coefs[0];
+        (rv->resampler.in_queue_r[(q - 6) & 7]) * reverb_new_lowpass_coefs[0] +
+        (rv->resampler.in_queue_r[(q - 4) & 7]) * reverb_new_lowpass_coefs[1] +
+        (rv->resampler.in_queue_r[(q - 3) & 7]) * reverb_new_lowpass_coefs[2] +
+        (rv->resampler.in_queue_r[(q - 2) & 7]) * reverb_new_lowpass_coefs[1] +
+        (rv->resampler.in_queue_r[(q - 0) & 7]) * reverb_new_lowpass_coefs[0];
       r >>= 11;
 */
-//l = state->reverb.resampler.in_queue_l[q & 7];
-//r = state->reverb.resampler.in_queue_r[q & 7];
+//l = rv->resampler.in_queue_l[q & 7];
+//r = rv->resampler.in_queue_r[q & 7];
 
       /*
       ** Run the reverb engine
       */
-      reverb_engine22(state, ram, &l, &r);
+      reverb_engine22(rv, ram, write_enable, &l, &r);
       /*
       ** Put the new stuff into the output queue
       */
-      state->reverb.resampler.out_queue_l[q & 15] = l;
-      state->reverb.resampler.out_queue_r[q & 15] = r;
+      rv->resampler.out_queue_l[q & 15] = l;
+      rv->resampler.out_queue_r[q & 15] = r;
     }
     /*
     ** Upsample
@@ -1621,29 +1598,29 @@ static void EMU_CALL reverb_process(struct SPUCORE_STATE *state, uint16 *ram, si
 #define gauss_table_0x380 gauss_shuffled_reverse_table[0x003]
     if(q & 1) {
       l =
-        (state->reverb.resampler.out_queue_l[(q - 6) & 15]) * gauss_table_0x080 +
-        (state->reverb.resampler.out_queue_l[(q - 4) & 15]) * gauss_table_0x180 +
-        (state->reverb.resampler.out_queue_l[(q - 2) & 15]) * gauss_table_0x280 +
-        (state->reverb.resampler.out_queue_l[(q - 0) & 15]) * gauss_table_0x380;
+        (rv->resampler.out_queue_l[(q - 6) & 15]) * gauss_table_0x080 +
+        (rv->resampler.out_queue_l[(q - 4) & 15]) * gauss_table_0x180 +
+        (rv->resampler.out_queue_l[(q - 2) & 15]) * gauss_table_0x280 +
+        (rv->resampler.out_queue_l[(q - 0) & 15]) * gauss_table_0x380;
       l >>= 15;
       r =
-        (state->reverb.resampler.out_queue_r[(q - 6) & 15]) * gauss_table_0x080 +
-        (state->reverb.resampler.out_queue_r[(q - 4) & 15]) * gauss_table_0x180 +
-        (state->reverb.resampler.out_queue_r[(q - 2) & 15]) * gauss_table_0x280 +
-        (state->reverb.resampler.out_queue_r[(q - 0) & 15]) * gauss_table_0x380;
+        (rv->resampler.out_queue_r[(q - 6) & 15]) * gauss_table_0x080 +
+        (rv->resampler.out_queue_r[(q - 4) & 15]) * gauss_table_0x180 +
+        (rv->resampler.out_queue_r[(q - 2) & 15]) * gauss_table_0x280 +
+        (rv->resampler.out_queue_r[(q - 0) & 15]) * gauss_table_0x380;
       r >>= 15;
     } else {
       l =
-        (state->reverb.resampler.out_queue_l[(q - 7) & 15]) * gauss_table_0x000 +
-        (state->reverb.resampler.out_queue_l[(q - 5) & 15]) * gauss_table_0x100 +
-        (state->reverb.resampler.out_queue_l[(q - 3) & 15]) * gauss_table_0x200 +
-        (state->reverb.resampler.out_queue_l[(q - 1) & 15]) * gauss_table_0x300;
+        (rv->resampler.out_queue_l[(q - 7) & 15]) * gauss_table_0x000 +
+        (rv->resampler.out_queue_l[(q - 5) & 15]) * gauss_table_0x100 +
+        (rv->resampler.out_queue_l[(q - 3) & 15]) * gauss_table_0x200 +
+        (rv->resampler.out_queue_l[(q - 1) & 15]) * gauss_table_0x300;
       l >>= 15;
       r =
-        (state->reverb.resampler.out_queue_r[(q - 7) & 15]) * gauss_table_0x000 +
-        (state->reverb.resampler.out_queue_r[(q - 5) & 15]) * gauss_table_0x100 +
-        (state->reverb.resampler.out_queue_r[(q - 3) & 15]) * gauss_table_0x200 +
-        (state->reverb.resampler.out_queue_r[(q - 1) & 15]) * gauss_table_0x300;
+        (rv->resampler.out_queue_r[(q - 7) & 15]) * gauss_table_0x000 +
+        (rv->resampler.out_queue_r[(q - 5) & 15]) * gauss_table_0x100 +
+        (rv->resampler.out_queue_r[(q - 3) & 15]) * gauss_table_0x200 +
+        (rv->resampler.out_queue_r[(q - 1) & 15]) * gauss_table_0x300;
       r >>= 15;
     }
     /*
@@ -1654,7 +1631,7 @@ static void EMU_CALL reverb_process(struct SPUCORE_STATE *state, uint16 *ram, si
     buf[1] = r;
     buf += 2;
   }
-  state->reverb.resampler.queue_index = q;
+  rv->resampler.queue_index = q;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1802,7 +1779,7 @@ static void EMU_CALL render(struct SPUCORE_STATE *state, uint16 *ram, sint16 *bu
   ** values out of it, resampling to/from 22KHz, etc.
   */
   if(effectout) {
-    reverb_process(state, ram, ibufrvb, samples);
+    reverb_process(&(state->reverb), ram, !!(state->flags & SPUREG_FLAG_REVERB_ENABLE), ibufrvb, samples);
   }
   /*
   **
@@ -2028,13 +2005,13 @@ void EMU_CALL spucore_setreg(void *state, uint32 n, uint32 value, uint32 mask) {
   case SPUREG_ESA:
     SPUCORESTATE->reverb.start_address &= ~mask;
     SPUCORESTATE->reverb.start_address |= value;
-    make_safe_reverb_addresses(state);
+    make_safe_reverb_addresses(&(SPUCORESTATE->reverb), SPUCORESTATE->memsize);
     SPUCORESTATE->reverb.current_address = SPUCORESTATE->reverb.safe_start_address;
     break;
   case SPUREG_EEA:
     SPUCORESTATE->reverb.end_address &= ~mask;
     SPUCORESTATE->reverb.end_address |= value;
-    make_safe_reverb_addresses(state);
+    make_safe_reverb_addresses(&(SPUCORESTATE->reverb), SPUCORESTATE->memsize);
     break;
   case SPUREG_IRQA:
     /* TODO: actual implementation of IRQs */
@@ -2180,6 +2157,98 @@ void EMU_CALL spucore_set_reverb_buf(void *state, sint16 *buf) {
 
 void EMU_CALL spucore_clear_reverb_buf(void *state) {
   SPUCORESTATE->reverb_buf = NULL;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/*
+** Standalone reverb unit
+**
+** Runs the same reverb engine as the SPU core, but on a private work area,
+** so it can be fed an arbitrary input signal (e.g. a single stem) while
+** following the register settings of a real SPU core.
+*/
+
+struct SPUCORE_REVERB_UNIT {
+  struct SPUCORE_REVERB reverb;
+  sint32 memsize;
+  int write_enable;
+  sint16 evol[2];
+};
+
+#define REVERBUNIT    ((struct SPUCORE_REVERB_UNIT*)(unit))
+#define REVERBUNITRAM ((uint16*)(((uint8*)(unit)) + sizeof(struct SPUCORE_REVERB_UNIT)))
+
+/*
+** Registers that determine the work area layout; if any of these change,
+** the old buffer contents no longer mean anything
+*/
+#define REVERB_LAYOUT_FIELDS(X) \
+  X(start_address) X(end_address) X(FB_SRC_A) X(FB_SRC_B) \
+  X(IIR_DEST_A0) X(IIR_DEST_A1) X(IIR_DEST_B0) X(IIR_DEST_B1) \
+  X(IIR_SRC_A0) X(IIR_SRC_A1) X(IIR_SRC_B0) X(IIR_SRC_B1) \
+  X(ACC_SRC_A0) X(ACC_SRC_A1) X(ACC_SRC_B0) X(ACC_SRC_B1) \
+  X(ACC_SRC_C0) X(ACC_SRC_C1) X(ACC_SRC_D0) X(ACC_SRC_D1) \
+  X(MIX_DEST_A0) X(MIX_DEST_A1) X(MIX_DEST_B0) X(MIX_DEST_B1)
+
+uint32 EMU_CALL spucore_reverb_get_state_size(uint32 memsize) {
+  return sizeof(struct SPUCORE_REVERB_UNIT) + memsize;
+}
+
+void EMU_CALL spucore_reverb_clear_state(void *unit, uint32 memsize) {
+  memset(unit, 0, spucore_reverb_get_state_size(memsize));
+  REVERBUNIT->memsize = (sint32)memsize;
+  REVERBUNIT->reverb.end_address = memsize - 1;
+  make_safe_reverb_addresses(&(REVERBUNIT->reverb), REVERBUNIT->memsize);
+}
+
+void EMU_CALL spucore_reverb_sync(void *unit, void *state) {
+  struct SPUCORE_REVERB *dst = &(REVERBUNIT->reverb);
+  struct SPUCORE_REVERB *src = &(SPUCORESTATE->reverb);
+  int relayout = 0;
+
+#define REVERB_LAYOUT_CHANGED(x) if(dst->x != src->x) { relayout = 1; }
+  REVERB_LAYOUT_FIELDS(REVERB_LAYOUT_CHANGED)
+#undef REVERB_LAYOUT_CHANGED
+
+  /* Registers, ESA and EEA all precede current_address in the struct */
+  memcpy(dst, src, offsetof(struct SPUCORE_REVERB, current_address));
+
+  if(relayout) {
+    memset(REVERBUNITRAM, 0, REVERBUNIT->memsize);
+    make_safe_reverb_addresses(dst, REVERBUNIT->memsize);
+    dst->current_address = dst->safe_start_address;
+  }
+
+  REVERBUNIT->write_enable = !!(SPUCORESTATE->flags & SPUREG_FLAG_REVERB_ENABLE);
+  REVERBUNIT->evol[0] = SPUCORESTATE->evol[0];
+  REVERBUNIT->evol[1] = SPUCORESTATE->evol[1];
+}
+
+void EMU_CALL spucore_reverb_render(void *unit, const sint16 *in, sint16 *out, uint32 samples) {
+  sint32 buf[2 * RENDERMAX];
+  sint64 evol_l = REVERBUNIT->evol[0];
+  sint64 evol_r = REVERBUNIT->evol[1];
+  while(samples) {
+    uint32 n = (samples > RENDERMAX) ? RENDERMAX : samples;
+    uint32 i;
+    if(in) {
+      for(i = 0; i < 2 * n; i++) buf[i] = in[i];
+      in += 2 * n;
+    } else {
+      memset(buf, 0, sizeof(sint32) * 2 * n);
+    }
+    reverb_process(&(REVERBUNIT->reverb), REVERBUNITRAM, REVERBUNIT->write_enable, buf, n);
+    /* Apply EVOL exactly as render() does for the reverb return */
+    for(i = 0; i < n; i++) {
+      sint32 l = (sint32)((buf[2*i+0] * evol_l) >> 15);
+      sint32 r = (sint32)((buf[2*i+1] * evol_r) >> 15);
+      CLIP_PCM_2(l, r);
+      out[2*i+0] = (sint16)l;
+      out[2*i+1] = (sint16)r;
+    }
+    out += 2 * n;
+    samples -= n;
+  }
 }
 
 uint32 EMU_CALL spucore_get_voice_ssa(void *state, uint32 voice) {

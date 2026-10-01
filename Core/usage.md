@@ -247,6 +247,20 @@ for (int i = 0; i < count; i++) {
 }
 ```
 
+### Standalone Reverb Units
+
+To get a separate wet signal per stem, run each stem through its own reverb unit. A unit is the SPU reverb engine with a private work area (sized like SPU RAM). `spu_reverb_sync()` copies the reverb registers, EVOL and reverb enable flag from an SPU core. If the work area layout changed, it also clears the unit's buffer. The output has EVOL applied, the same as the `spu_set_reverb_buf()` signal. The engine is linear apart from rounding and saturation, so the per-stem wets sum to approximately the global reverb return.
+
+```c
+void *unit = malloc(spu_reverb_get_state_size(1));   // 1 = PS1, 2 = PS2
+spu_reverb_clear_state(unit, 1);
+
+// After each psx_execute():
+spu_reverb_sync(unit, spu_state, 0);                // follow core 0's reverb settings
+spu_reverb_render(unit, stem_buf, stem_wet_buf, samples_out);
+// Pass NULL as the input to feed silence (lets an existing tail ring out)
+```
+
 ### Stem Extraction API
 
 | Function | Description |
@@ -261,6 +275,10 @@ for (int i = 0; i < count; i++) {
 | `spu_get_voice_ssa_reg(state, voice)` | SSA as stored in the hardware register |
 | `spu_get_kon(state)` | Read the Key-On register |
 | `spu_scan_samples(state, out_addrs, max)` | Scan SPU RAM for ADPCM sample blocks |
+| `spu_reverb_get_state_size(version)` | Size of a standalone reverb unit |
+| `spu_reverb_clear_state(reverb, version)` | Initialise a reverb unit and clear its work area |
+| `spu_reverb_sync(reverb, state, core)` | Copy reverb registers, EVOL and enable flag from an SPU core |
+| `spu_reverb_render(reverb, in, out, samples)` | Run stereo input (or NULL for silence) through the unit |
 
 ---
 

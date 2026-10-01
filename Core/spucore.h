@@ -41,6 +41,15 @@ uint32 EMU_CALL spucore_get_voice_ssa  (void *state, uint32 voice);
 int    EMU_CALL spucore_scan_samples   (uint16 *ram, uint32 ramsize, uint32 reverb_start, uint32 *out_addrs, int max_addrs);
 
 /*
+** Standalone reverb unit: the SPU reverb engine with a private work area of
+** memsize bytes, driven by the registers of an SPU core (see spucore_reverb_sync)
+*/
+uint32 EMU_CALL spucore_reverb_get_state_size(uint32 memsize);
+void   EMU_CALL spucore_reverb_clear_state   (void *unit, uint32 memsize);
+void   EMU_CALL spucore_reverb_sync          (void *unit, void *state);
+void   EMU_CALL spucore_reverb_render        (void *unit, const sint16 *in, sint16 *out, uint32 samples);
+
+/*
 ** Register definitions
 */
 

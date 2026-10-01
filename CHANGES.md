@@ -53,3 +53,28 @@ Thin wrappers at the `spu` layer that delegate to the `spucore` functions above.
 | `spu_get_voice_ssa_reg(state, voice)` | SSA value as stored in the hardware register |
 | `spu_get_kon(state)` | Read the Key-On register |
 | `spu_scan_samples(state, out_addrs, max_addrs)` | Scan SPU RAM for ADPCM sample blocks |
+
+## Reverb
+
+### Formula (`Core/spucore.c`)
+
+The reverb step (`reverb_step22`, formerly `reverb_steadystate22`) now follows the nocash psx-spx reverb formula. The previous implementation followed an early reverse-engineered model. Changes:
+
+- **All-pass filters**: the late reverb is now two cascaded all-pass filters (APF1 → APF2), and the wet output is the APF2 output. Previously, `[mLAPF2]` was computed as `vAPF1·comb − (vAPF1 ^ 0x8000)·[mLAPF1−dAPF1] − vAPF2·[mLAPF2−dAPF2]`, and the wet output was the sum of the raw `[mLAPF1]` and `[mLAPF2]` buffer writes.
+- **Reflection (IIR) addressing**: each reflection now reads `[m−2]` and writes `[m]`, as on hardware. Previously it read `[m]` and wrote `[m+2]`, so the stored data was one sample ahead of hardware and every tap reading those buffers had a delay one sample too short.
+- **Input scaling**: removed the non-hardware 2/3 attenuation of the reverb input.
+- **Reverb master enable**: when disabled, buffer writes are skipped but the output is still computed from the buffer contents (previously the whole step was skipped and the raw buffer values were returned).
+- The engine now operates on a `struct SPUCORE_REVERB` and a RAM pointer rather than the whole core state, so it can be shared with the standalone reverb unit below.
+
+These changes are not in the formula and are left as they were: the 39-tap downsampling FIR, the Gaussian 22→44.1 kHz upsampling, and saturation of intermediate values to ±32767.
+
+### Standalone reverb unit
+
+A reverb unit is the same reverb engine with a private work area. It follows an SPU core's reverb settings but processes caller-supplied input, e.g. for a per-stem wet signal.
+
+| Function | Description |
+|---|---|
+| `spucore_reverb_get_state_size(memsize)` / `spu_reverb_get_state_size(version)` | Size of a reverb unit including its work area |
+| `spucore_reverb_clear_state(unit, memsize)` / `spu_reverb_clear_state(unit, version)` | Initialise a unit |
+| `spucore_reverb_sync(unit, core_state)` / `spu_reverb_sync(unit, spu_state, core)` | Copy reverb registers, ESA/EEA, EVOL and the reverb enable flag from a core. If any work-area address register changed, clears the unit's buffer and restarts it at ESA |
+| `spucore_reverb_render(unit, in, out, samples)` / `spu_reverb_render(...)` | Process stereo 44.1 kHz input (`NULL` = silence) and write the EVOL-scaled wet signal |

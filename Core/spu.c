@@ -864,3 +864,28 @@ int EMU_CALL spu_scan_samples(void *state, uint32 *out_addrs, int max_addrs) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+/*
+** Standalone reverb unit
+*/
+
+static uint32 EMU_CALL spu_reverb_mem_size(uint8 version) {
+  return (version == 2) ? 0x200000 : 0x80000;
+}
+
+uint32 EMU_CALL spu_reverb_get_state_size(uint8 version) {
+  return spucore_reverb_get_state_size(spu_reverb_mem_size(version));
+}
+
+void EMU_CALL spu_reverb_clear_state(void *reverb, uint8 version) {
+  spucore_reverb_clear_state(reverb, spu_reverb_mem_size(version));
+}
+
+void EMU_CALL spu_reverb_sync(void *reverb, void *state, uint32 core) {
+  spucore_reverb_sync(reverb, CORESTATE(core ? 1 : 0));
+}
+
+void EMU_CALL spu_reverb_render(void *reverb, const sint16 *in, sint16 *out, uint32 samples) {
+  spucore_reverb_render(reverb, in, out, samples);
+}
+
+////////////////////////////////////////////////////////////////////////////////

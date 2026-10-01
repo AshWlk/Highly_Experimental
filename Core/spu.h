@@ -47,6 +47,20 @@ uint32 EMU_CALL spu_get_voice_ssa_reg (void *state, uint32 voice);
 uint32 EMU_CALL spu_get_kon           (void *state);
 int    EMU_CALL spu_scan_samples      (void *state, uint32 *out_addrs, int max_addrs);
 
+/*
+** Standalone reverb unit
+**
+** A copy of the SPU reverb engine with its own private work area. Sync it
+** from an SPU core to pick up that core's reverb registers, EVOL and reverb
+** enable flag, then render any stereo input through it (in may be NULL for
+** silence). Output has EVOL applied, matching the spu_set_reverb_buf signal.
+** version = 1 for PS1, 2 for PS2 (sizes the work area to match SPU RAM).
+*/
+uint32 EMU_CALL spu_reverb_get_state_size(uint8 version);
+void   EMU_CALL spu_reverb_clear_state   (void *reverb, uint8 version);
+void   EMU_CALL spu_reverb_sync          (void *reverb, void *state, uint32 core);
+void   EMU_CALL spu_reverb_render        (void *reverb, const sint16 *in, sint16 *out, uint32 samples);
+
 #ifdef __cplusplus
 }
 #endif
